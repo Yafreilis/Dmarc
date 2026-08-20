@@ -26,6 +26,9 @@ def get_db_connection():
 def process_emails():
     logger.info("Iniciando procesamiento de correos con estado 'new'...")
     
+    total_processed_files = 0
+    total_duplicate_files = 0
+
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             # 1. Obtener correos pendientes que tienen adjuntos
@@ -110,12 +113,14 @@ def process_emails():
                         
                         rep_row = cur.fetchone()
                         if not rep_row:
-                            logger.warning(f"Reporte duplicado: {report_id}")
+                            logger.warning(f"Reporte duplicado omitido: {report_id}")
+                            total_duplicate_files += 1
                             skipped_reason = 'duplicate_report'
                             continue
 
                         report_db_id = rep_row['id']
                         processed_any = True
+                        total_processed_files += 1
 
                         # Insertar registros detallados
                         for rec in report_data.get('records', []):
@@ -154,6 +159,8 @@ def process_emails():
                     cur.execute("UPDATE emails SET status = 'skipped', status_detail = %s, processed_at = NOW() WHERE id = %s;", (skipped_reason, email_id,))
                 
                 conn.commit()
+        
+        logger.info(f"Procesamiento finalizado. Nuevos guardados: {total_processed_files} | Duplicados omitidos: {total_duplicate_files}")
 
 if __name__ == "__main__":
     if "--list" in sys.argv:
@@ -165,24 +172,113 @@ if __name__ == "__main__":
                 except ValueError:
                     pass
 
-        print(f"\nListando reportes de los últimos {days} días...\n")
-        print(f"{'ID':<5} | {'Org Name':<20} | {'Dominio':<25} | {'Inicio':<20} | {'Fin'}")
-        print("-" * 90)
+        print(f"\n==================================================================================")
+        print(f"       REPORTE ANALÍTICO DMARC - DÍA EXACTO DE HACE {days} DÍAS")
+        print(f"==================================================================================\n")
 
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                # 1. Estadísticas generales (Total reportes, Total mensajes, Mensajes exitosos)
                 cur.execute("""
-                    SELECT id, org_name, domain, begin_date, end_date 
-                    FROM dmarc_reports 
-                    WHERE created_at >= NOW() - MAKE_INTERVAL(days := %s)
-                    ORDER BY begin_date DESC;
+                    SELECT 
+                        COUNT(DISTINCT r.id) as total_reports,
+                        COALESCE(SUM(rec.message_count), 0) as total_messages,
+                        COALESCE(SUM(CASE WHEN rec.dmarc_pass THEN rec.message_count ELSE 0 END), 0) as passed_messages
+                    FROM dmarc_reports r
+                    LEFT JOIN dmarc_records rec ON r.id = rec.report_id
+                    WHERE r.begin_date::date = CURRENT_DATE - MAKE_INTERVAL(days := %s);
                 """, (days,))
-                reports = cur.fetchall()
+                general_stats = cur.fetchone()
+
+                # 1.1 Conteo de reportes marcados como duplicados en la base de datos (basado en el estatus de los emails o registros omitidos)
+                # Opcional: También podemos contar cuántos emails tienen status_detail = 'duplicate_report' procesados en esa fecha
+                cur.execute("""
+                    SELECT COUNT(*) as duplicate_emails_count
+                    FROM emails 
+                    WHERE status_detail = 'duplicate_report' 
+                      AND processed_at::date = CURRENT_DATE - MAKE_INTERVAL(days := %s);
+                """, (days,))
+                dup_res = cur.fetchone()
+                duplicate_count = dup_res['duplicate_emails_count'] if dup_res else 0
+
+                # 2. Detección de nuevas IPs (IPs vistas hoy pero nunca antes en fechas pasadas)
+                cur.execute("""
+                    SELECT COUNT(DISTINCT rec.source_ip) as new_ips_count
+                    FROM dmarc_records rec
+                    JOIN dmarc_reports r ON rec.report_id = r.id
+                    WHERE r.begin_date::date = CURRENT_DATE - MAKE_INTERVAL(days := %s)
+                      AND rec.source_ip NOT IN (
+                          SELECT DISTINCT rec2.source_ip 
+                          FROM dmarc_records rec2
+                          JOIN dmarc_reports r2 ON rec2.report_id = r2.id
+                          WHERE r2.begin_date::date < CURRENT_DATE - MAKE_INTERVAL(days := %s)
+                      );
+                """, (days, days))
+                new_ips_res = cur.fetchone()
+                new_ips_count = new_ips_res['new_ips_count'] if new_ips_res else 0
+
+                total_reports = general_stats['total_reports'] if general_stats else 0
+                total_messages = general_stats['total_messages'] if general_stats else 0
+                passed_messages = general_stats['passed_messages'] if general_stats else 0
+                pass_rate = (passed_messages / total_messages * 100) if total_messages > 0 else 0.0
+
+                print(f"📊 RESUMEN GENERAL:")
+                print(f"  • Reportes procesados exitosamente: {total_reports}")
+                print(f"  • Reportes omitidos por ser duplicados: {duplicate_count}")
+                print(f"  • Total de mensajes analizados: {total_messages}")
+                print(f"  • Tasa de éxito (DMARC Pass Rate): {pass_rate:.2f}% ({passed_messages}/{total_messages} mensajes)")
+                print(f"  • Nuevas IPs detectadas en el servidor: {new_ips_count}\n")
+
+                # 3. Desglose por políticas / disposiciones (none, quarantine, reject)
+                print(f"🛡️  DESGLOSE POR SECCIÓN DE POLÍTICA (DISPOSITION):")
+                print(f"  {'Disposición':<15} | {'Cantidad de Mensajes':<20} | {'Porcentaje'}")
+                print(f"  " + "-" * 55)
                 
-                if not reports:
-                    print("No se encontraron reportes en el período especificado.")
-                for r in reports:
-                    print(f"{r['id']:<5} | {str(r['org_name']):<20} | {str(r['domain']):<25} | {str(r['begin_date']):<20} | {str(r['end_date'])}")
-        print("\n")
+                cur.execute("""
+                    SELECT COALESCE(rec.disposition, 'n/a') as disposition, 
+                           SUM(rec.message_count) as msg_count
+                    FROM dmarc_reports r
+                    JOIN dmarc_records rec ON r.id = rec.report_id
+                    WHERE r.begin_date::date = CURRENT_DATE - MAKE_INTERVAL(days := %s)
+                    GROUP BY rec.disposition
+                    ORDER BY msg_count DESC;
+                """, (days,))
+                disposition_rows = cur.fetchall()
+
+                if not disposition_rows:
+                    print("  No hay registros de disposición para este período.")
+                else:
+                    for d in disposition_rows:
+                        pct = (d['msg_count'] / total_messages * 100) if total_messages > 0 else 0.0
+                        print(f"  {str(d['disposition']):<15} | {str(d['msg_count']):<20} | {pct:.2f}%")
+                print()
+
+                # 4. Top 10 IPs de origen más activas
+                print(f"🏆 TOP 10 IPs DE ORIGEN (Más activas):")
+                print(f"  {'IP de Origen':<18} | {'País':<6} | {'Mensajes':<10} | {'Pass Rate':<10} | {'Dominio'}")
+                print(f"  " + "-" * 75)
+
+                cur.execute("""
+                    SELECT rec.source_ip, rec.source_country, 
+                           SUM(rec.message_count) as total_msgs,
+                           SUM(CASE WHEN rec.dmarc_pass THEN rec.message_count ELSE 0 END) as passed_msgs,
+                           r.domain
+                    FROM dmarc_reports r
+                    JOIN dmarc_records rec ON r.id = rec.report_id
+                    WHERE r.begin_date::date = CURRENT_DATE - MAKE_INTERVAL(days := %s)
+                    GROUP BY rec.source_ip, rec.source_country, r.domain
+                    ORDER BY total_msgs DESC
+                    LIMIT 10;
+                """, (days,))
+                top_ips = cur.fetchall()
+
+                if not top_ips:
+                    print("  No se encontraron IPs en este período.")
+                else:
+                    for ip in top_ips:
+                        ip_pass_rate = (ip['passed_msgs'] / ip['total_msgs'] * 100) if ip['total_msgs'] > 0 else 0.0
+                        country = ip['source_country'] if ip['source_country'] else 'N/A'
+                        print(f"  {str(ip['source_ip']):<18} | {str(country):<6} | {str(ip['total_msgs']):<10} | {ip_pass_rate:>6.1f}%     | {str(ip['domain'])}")
+                print("\n==================================================================================\n")
     else:
         process_emails()
