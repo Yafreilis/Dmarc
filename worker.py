@@ -1,4 +1,14 @@
 import os
+import sys
+
+# Forzar codificación UTF-8 en Windows para evitar errores de charmap
+if sys.platform.startswith("win"):
+    import codecs
+    if hasattr(sys.stdout, "detach"):
+        sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
+    if hasattr(sys.stderr, "detach"):
+        sys.stderr = codecs.getwriter("utf-8")(sys.stderr.detach())
+
 import io
 import uuid
 import gzip
@@ -14,18 +24,29 @@ from dotenv import load_dotenv
 import requests
 import msal
 
-# Importar la función de procesamiento desde process.py
 from process import process_emails
 
 load_dotenv()
 
-# Configuración del sistema de Logging (escribe en consola y en log_ejecucion.txt)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(BASE_DIR, "worker_log.txt")
+
+# Asegurar que el archivo de log exista desde el inicio e imprimir directamente
+if not os.path.exists(LOG_PATH):
+    with open(LOG_PATH, "w", encoding="latin-1") as f:
+        f.write(f"[{datetime.now()}] Archivo de log inicializado correctamente.\n")
+
+class FlushFileHandler(logging.FileHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("log_ejecucion.txt", encoding="utf-8"),
-        logging.StreamHandler()
+        FlushFileHandler(LOG_PATH, encoding="latin-1"),
+        logging.StreamHandler(sys.stdout)
     ]
 )
 
@@ -62,44 +83,42 @@ def es_reporte_dmarc_valido(contenido_bytes):
         pass
     return False
 
-def insertar_adjunto(cur, filename, contenido_bytes, sender="dmarc-reports@domain.com"):
-    # Verificamos si el contenido exacto ya existe en la base de datos (evita duplicados)
-    cur.execute(
-        "SELECT COUNT(1) FROM email_attachments WHERE content_bytes = %s;",
-        (contenido_bytes,)
-    )
-    existe = cur.fetchone()[0]
-    
-    if existe > 0:
-        logging.info(f"    [Omitido] El reporte '{filename}' ya existe en la base de datos (contenido duplicado).")
-        return
+def es_adjunto_dmarc_candidato(nombre_archivo):
+    """Filtra si el nombre del archivo adjunto corresponde a un reporte DMARC basado en extensiones estándar."""
+    nombre_lower = nombre_archivo.lower()
+    extensiones_validas = (".zip", ".gz", ".tgz", ".xml", ".tar.gz")
+    return nombre_lower.endswith(extensiones_validas)
 
-    # Si no existe, procedemos con la inserción normal
-    unique_suffix = uuid.uuid4().hex[:8]
-    message_id = f"graph-dmarc-{filename}-{unique_suffix}@local.domain"
-    
+def insertar_adjunto_con_id_real(cur, graph_msg_id, filename, contenido_bytes, sender="dmarc-reports@domain.com"):
+    # 1. Verificar si este correo exacto (graph_msg_id) ya fue registrado en la base de datos
     cur.execute(
-        """
-        INSERT INTO emails (
-            internet_message_id, 
-            sender, 
-            recipients, 
-            received_timestamptz, 
-            status
-        )
-        VALUES (%s, %s, %s, NOW(), 'new')
-        RETURNING id;
-        """,
-        (
-            message_id, 
-            sender, 
-            USER_EMAIL
-        )
+        "SELECT id FROM emails WHERE internet_message_id = %s LIMIT 1;",
+        (graph_msg_id,)
     )
-    
-    row = cur.fetchone()
-    email_id = row[0]
+    email_row = cur.fetchone()
 
+    if email_row:
+        email_id = email_row[0]
+        cur.execute(
+            "SELECT 1 FROM email_attachments WHERE email_id = %s AND filename = %s LIMIT 1;",
+            (email_id, filename)
+        )
+        if cur.fetchone():
+            logging.info(f"    [Omitido] El archivo '{filename}' ya existe para este mensaje.")
+            return
+    else:
+        # 2. Si el correo no existe, lo insertamos primero con estado 'new' y retry_count = 0
+        cur.execute(
+            """
+            INSERT INTO emails (internet_message_id, sender, recipients, received_timestamptz, status, retry_count)
+            VALUES (%s, %s, %s, NOW(), 'new', 0)
+            RETURNING id;
+            """,
+            (graph_msg_id, sender, USER_EMAIL)
+        )
+        email_id = cur.fetchone()[0]
+
+    # 3. Insertar el adjunto vinculado al ID del correo correspondiente
     cur.execute(
         """
         INSERT INTO email_attachments (email_id, filename, content_bytes)
@@ -177,44 +196,71 @@ def sincronizar_correos_graph(cur):
         "Content-Type": "application/json"
     }
     
-    endpoint = f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/messages?$filter=hasAttachments eq true&$select=id,subject,sender,receivedDateTime&$top=999"
+    # Endpoint optimizado con filtro de adjuntos y selección de campos clave
+    endpoint = (
+        f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/messages"
+        f"?$filter=hasAttachments eq true"
+        f"&$select=id,subject,sender,receivedDateTime,hasAttachments"
+        f"&$top=1000"
+    )
     
-    response = requests.get(endpoint, headers=headers)
-    if response.status_code != 200:
-        logging.error(f"Error al consultar Graph API: {response.status_code} - {response.text}")
-        return
+    total_procesados_ciclo = 0
 
-    mensajes = response.json().get("value", [])
-    logging.info(f"DEBUG - Total de mensajes devueltos por Graph API: {len(mensajes)}")
+    # Bucle de paginación continua para procesar todo el buzón sin interrupciones
+    while endpoint:
+        response = requests.get(endpoint, headers=headers)
+        if response.status_code != 200:
+            logging.error(f"Error al consultar Graph API: {response.status_code} - {response.text}")
+            break
 
-    for msg in mensajes:
-        msg_id = msg["id"]
-        sender_email = msg.get("sender", {}).get("emailAddress", {}).get("address", "unknown@domain.com")
-        received_str = msg.get("receivedDateTime", "")
+        data = response.json()
+        mensajes = data.get("value", [])
+        total_procesados_ciclo += len(mensajes)
+        logging.info(f"DEBUG - Página actual obtenida: {len(mensajes)} mensajes (Acumulado en este ciclo: {total_procesados_ciclo})")
 
-        sender_name_part = sender_email.split("@")[0].lower()
-        sender_id = "".join(c for c in sender_name_part if c.isalnum() or c in ("_", "-", "."))
-        if not sender_id:
-            sender_id = "unknown"
-
-        try:
-            dt = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
-            date_str = dt.strftime("%d%m%y")
-        except Exception:
-            date_str = datetime.now().strftime("%d%m%y")
-
-        logging.info(f"Procesando correo ID: {msg_id} (De: {sender_email})")
-        
-        att_endpoint = f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/messages/{msg_id}/messages/{msg_id}/attachments" if False else f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/messages/{msg_id}/attachments"
-        att_response = requests.get(att_endpoint, headers=headers)
-        
-        if att_response.status_code != 200:
-            logging.error(f"    [Error] No se pudieron obtener los adjuntos del mensaje {msg_id}")
-            continue
+        for msg in mensajes:
+            msg_id = msg["id"]
+            subject = msg.get("subject", "")
+            sender_email = msg.get("sender", {}).get("emailAddress", {}).get("address", "unknown@domain.com")
             
-        adjuntos = att_response.json().get("value", [])
-        for att in adjuntos:
-            if att.get("@odata.type") == "#microsoft.graph.fileAttachment":
+            # Validación estricta para evitar reprocesar mensajes que ya están en la base de datos
+            cur.execute(
+                "SELECT COUNT(1) FROM emails WHERE internet_message_id = %s;",
+                (msg_id,)
+            )
+            if cur.fetchone()[0] > 0:
+                continue
+
+            att_endpoint = f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/messages/{msg_id}/attachments"
+            att_response = requests.get(att_endpoint, headers=headers)
+            
+            if att_response.status_code != 200:
+                logging.error(f"    [Error] No se pudieron obtener los adjuntos del mensaje {msg_id}")
+                continue
+                
+            adjuntos = att_response.json().get("value", [])
+            
+            # Filtro previo: Verificar si al menos un adjunto cumple con formato DMARC antes de registrar el correo
+            adjuntos_validos = [att for att in adjuntos if att.get("@odata.type") == "#microsoft.graph.fileAttachment" and es_adjunto_dmarc_candidato(att.get("name", ""))]
+            
+            if not adjuntos_validos:
+                continue
+
+            received_str = msg.get("receivedDateTime", "")
+            sender_name_part = sender_email.split("@")[0].lower()
+            sender_id = "".join(c for c in sender_name_part if c.isalnum() or c in ("_", "-", "."))
+            if not sender_id:
+                sender_id = "unknown"
+
+            try:
+                dt = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
+                date_str = dt.strftime("%d%m%y")
+            except Exception:
+                date_str = datetime.now().strftime("%d%m%y")
+
+            logging.info(f"Correo con adjunto DMARC detectado ID: {msg_id} (De: {sender_email} | Asunto: {subject})")
+
+            for att in adjuntos_validos:
                 nombre_adjunto = att.get("name")
                 raw_bytes = base64.b64decode(att.get("contentBytes"))
                 
@@ -222,26 +268,46 @@ def sincronizar_correos_graph(cur):
                 
                 if contenido_bytes:
                     nombre_personalizado = f"{sender_id}-{date_str}_{nombre_extraido}"
-                    insertar_adjunto(cur, nombre_personalizado, contenido_bytes, sender=sender_email)
+                    insertar_adjunto_con_id_real(cur, msg_id, nombre_personalizado, contenido_bytes, sender=sender_email)
                 else:
-                    logging.info(f"    [Aviso] El adjunto '{nombre_adjunto}' fue ignorado (no es un reporte DMARC válido).")
+                    logging.info(f"    [Aviso] El adjunto '{nombre_adjunto}' del correo no contenía un XML DMARC válido.")
+
+        endpoint = data.get("@odata.nextLink")
 
 if __name__ == "__main__":
-    logging.info("Iniciando servicio automático de ingesta DMARC (modo histórico completo con logging)...")
+    logging.info("Iniciando servicio automático de ingesta DMARC con control de duplicados, reintentos y paginación...")
     while True:
         try:
             logging.info("Iniciando ciclo de verificación de buzón...")
             with psycopg.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
+                    # 1. Reintentar correos con error que tengan menos de 3 intentos fallidos
+                    cur.execute("""
+                        UPDATE emails
+                        SET status = 'new', 
+                            retry_count = COALESCE(retry_count, 0) + 1
+                        WHERE status = 'error' 
+                          AND COALESCE(retry_count, 0) < 3;
+                    """)
+                    
+                    # 2. Marcar como 'failed' definitivo aquellos que ya alcanzaron o superaron los 3 intentos
+                    cur.execute("""
+                        UPDATE emails
+                        SET status = 'failed'
+                        WHERE status = 'error' 
+                          AND COALESCE(retry_count, 0) >= 3;
+                    """)
+
+                    # 3. Sincronizar nuevos correos desde Microsoft Graph
                     sincronizar_correos_graph(cur)
                 conn.commit()
             
-            # Ejecutar el procesamiento automático de los correos recién descargados ('new')
+            # 4. Ejecutar el procesamiento automático de los correos ('new', incluyendo los recuperados)
             process_emails()
 
-            logging.info("Ciclo completado. Esperando 5 minutos para la próxima verificación...")
+            logging.info("Ciclo completado. Esperando 2 minutos para la próxima verificación...")
             
         except Exception as db_err:
             logging.error(f"[Error de conexión o ejecución]: {db_err}")
             
-        time.sleep(300)
+        time.sleep(120)
